@@ -26,7 +26,13 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
           cd "$GITHUB_WORKSPACE/src"
           git checkout "${{ inputs.ref }}"
-          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::no patches/*.patch in this repository"
+            exit 1
+          fi
+          for p in "${patches[@]}"; do
             echo "applying $p"
             if ! git apply -v "$p"; then
               echo "::error::$p does not apply - its target file changed upstream, regenerate that patch"
