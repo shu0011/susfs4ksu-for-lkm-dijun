@@ -1,1 +1,51 @@
+name: Build susfs_guard_lkm (android17-6.18, kprobe tail-jump)
 
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'susfs4ksu-lkm branch/tag/commit to build'
+        required: false
+        default: 'main'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:android17-6.18-20260828
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Fetch guard LKM and apply patch
+        run: |
+          set -eux
+          git clone https://github.com/inforcqb/susfs4ksu-lkm "$GITHUB_WORKSPACE/src"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
+          cd "$GITHUB_WORKSPACE/src"
+          git checkout "${{ inputs.ref }}"
+          if ! git apply -v "$GITHUB_WORKSPACE/patches/01-susfs-supercall-tailjump.patch"; then
+            echo "::error::patch does not apply to ${GITHUB_SHA} - kernel/susfs_supercall.c changed upstream, regenerate the patch"
+            exit 1
+          fi
+          git diff --stat
+
+      - name: Build susfs_guard_lkm.ko
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE/src"
+          test -n "$KDIR"
+          test -f "$KDIR/Makefile"
+          make -k -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp kernel/susfs_guard_lkm.ko "$GITHUB_WORKSPACE/out/susfs_guard_lkm-android17-6.18.ko"
+          ls -l "$GITHUB_WORKSPACE/out"
+          modinfo "$GITHUB_WORKSPACE/out/susfs_guard_lkm-android17-6.18.ko" | head -20 || true
+
+      - name: Upload susfs_guard_lkm.ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: susfs_guard_lkm-android17-6.18
+          path: out/susfs_guard_lkm-android17-6.18.ko
