@@ -1,1 +1,182 @@
-
+--- a/kernel/susfs_supercall.c
++++ b/kernel/susfs_supercall.c
+@@ -9,8 +9,9 @@
+  *  - arm64 syscall-wrapper quirk: the kprobe sees regs->regs[0] == struct pt_regs * (the
+  *    wrapper's __regs argument); the real user args are in real_regs->regs[0..3] - SukiSU's
+  *    PT_REAL_REGS() / arch.h.
+- *  - a pre_handler runs in interrupt context and must not copy_from_user, so the command is
+- *    deferred to task_work (TWA_RESUME), i.e. process context - the same trick SukiSU uses.
++ *  - a pre_handler runs in interrupt context and must not copy_from_user, so it never runs a
++ *    command itself.  The sys_call_table wrapper defers to task_work (TWA_RESUME); the kprobe
++ *    fallback points regs->pc at reboot_tramp(), which runs in the syscall's own context.
+  * The handlers keep upstream's signature `void xxx(void __user **arg)`, *arg pointing at
+  * the userspace payload struct.
+  */
+@@ -149,12 +150,13 @@
+ 	kfree(info);
+ }
+ 
+-static void susfs_tw_func(struct callback_head *cb)
++/* Command dispatch shared by the two delivery paths: the sys_call_table wrapper defers it to
++ * task_work, the kprobe fallback runs it inline from reboot_tramp(). */
++static void susfs_supercall_dispatch(unsigned int cmd, void __user *payload)
+ {
+-	struct susfs_tw *tw = container_of(cb, struct susfs_tw, cb);
+-	void __user *arg = tw->payload;
++	void __user *arg = payload;
+ 
+-	switch (tw->cmd) {
++	switch (cmd) {
+ 	case CMD_SUSFS_SHOW_VERSION:
+ 		susfs_show_version(&arg);
+ 		break;
+@@ -167,7 +169,7 @@
+ 	case CMD_SUSFS_ADD_SUS_PATH:
+ 	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
+ 		/* The two commands answer a missing path differently upstream. */
+-		sus_path_supercall(tw->cmd, &arg);
++		sus_path_supercall(cmd, &arg);
+ 		break;
+ 	case CMD_SUSFS_ADD_SUS_MAP:
+ 		susfs_sus_map_supercall(&arg);
+@@ -175,7 +177,7 @@
+ 	case CMD_SUSFS_ADD_SUS_KSTAT:
+ 	case CMD_SUSFS_UPDATE_SUS_KSTAT:
+ 	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
+-		susfs_kstat_supercall(tw->cmd, &arg);
++		susfs_kstat_supercall(cmd, &arg);
+ 		break;
+ 	case CMD_SUSFS_SET_UNAME:
+ 		susfs_uname_supercall(&arg);
+@@ -199,12 +201,19 @@
+ 		/* Unreachable: reboot_pre() only defers a command susfs_cmd_handled()
+ 		 * accepted.  Kept as a net in case the two lists drift apart. */
+ 		pr_warn("susfs_guard_lkm: supercall: unsupported cmd 0x%x reached the worker (susfs_cmd_handled() and the switch disagree)\n",
+-			tw->cmd);
++			cmd);
+ 		break;
+ 	}
++}
++
++static void susfs_tw_func(struct callback_head *cb)
++{
++	struct susfs_tw *tw = container_of(cb, struct susfs_tw, cb);
++
++	susfs_supercall_dispatch(tw->cmd, tw->payload);
+ 	kfree(tw);
+ 
+-	/* Pairs with the try_module_get() in reboot_pre(): the callback runs from module .text,
++	/* Pairs with the try_module_get() in reboot_wrapper(): the callback runs from module .text,
+ 	 * after the syscall has already returned to userspace. */
+ 	module_put(THIS_MODULE);
+ }
+@@ -324,6 +333,46 @@
+ 	return reboot_orig ? reboot_orig(regs) : -EINVAL;
+ }
+ 
++/*
++ * Tail-jump target of the kprobe fallback.
++ *
++ * reboot_pre() points regs->pc here rather than skipping to regs->regs[30].  Execution
++ * resumes in the syscall's own context (process context, so the handlers may sleep and
++ * copy_from_user), x30 is untouched, and this function's return goes straight back to
++ * invoke_syscall(), which stores it as the result.  Nothing is deferred, so answering 0
++ * means the command actually ran - the caller never sees a success the kernel did not
++ * deliver.
++ */
++static long reboot_tramp(const struct pt_regs *uregs)
++{
++	int magic1, magic2;
++	unsigned int cmd;
++	void __user *payload;
++	long ret = -EINVAL;
++
++	if (!try_module_get(THIS_MODULE))
++		return -EINVAL;
++
++	magic1 = (int)uregs->regs[0];
++	magic2 = (int)uregs->regs[1];
++	cmd = (unsigned int)uregs->regs[2];
++	payload = (void __user *)uregs->regs[3];
++
++	/* reboot_pre() matched these already; the feature bitmap can however have been
++	 * disarmed between the probe and this call. */
++	if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == SUSFS_MAGIC && current_uid().val == 0 &&
++	    susfs_cmd_handled(cmd)) {
++		susfs_supercall_dispatch(cmd, payload);
++		ret = 0;
++	} else {
++		SUSFS_LOGI("susfs supercall: cmd 0x%x is not handled any more\n", cmd);
++	}
++
++	module_put(THIS_MODULE);
++
++	return ret;
++}
++
+ static struct susfs_fp_hook reboot_hook = {
+ 	.nr = __NR_reboot,
+ 	.nr_compat = 0,
+@@ -344,8 +393,6 @@
+ 	struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
+ 	int magic1, magic2;
+ 	unsigned int cmd;
+-	void __user *payload;
+-	struct susfs_tw *tw;
+ 
+ 	/* A prober runs before the callee, so an argument the callee would have checked is
+ 	 * still raw here (see the filename_lookup lesson in sus_path.c). */
+@@ -355,7 +402,6 @@
+ 	magic1 = (int)real_regs->regs[0];
+ 	magic2 = (int)real_regs->regs[1];
+ 	cmd = (unsigned int)real_regs->regs[2];
+-	payload = (void __user *)real_regs->regs[3];
+ 
+ 	if (magic1 != KSU_INSTALL_MAGIC1)
+ 		return 0;
+@@ -371,40 +417,11 @@
+ 		return 0;
+ 	}
+ 
+-	/* The callback runs from module .text when this task next returns to userspace, which can
+-	 * be after `rmmod` has already freed the module: the kprobe is on a vmlinux symbol, so
+-	 * its registration does not hold a reference for us, and unregister_kprobe() cannot
+-	 * cancel a task_work that is already queued.  Pin the module until the callback has
+-	 * run.  GFP_ATOMIC context, so no sleeping here. */
+-	if (!try_module_get(THIS_MODULE))
+-		return 0;
+-
+-	tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+-	if (!tw) {
+-		module_put(THIS_MODULE);
+-		return 0;
+-	}
+-	tw->cmd = cmd;
+-	tw->payload = payload;
+-	tw->cb.func = susfs_tw_func;
+-
+-	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+-		kfree(tw);
+-		module_put(THIS_MODULE);
+-		pr_warn("susfs supercall: task_work_add failed\n");
+-		return 0;
+-	}
+-
+-	/* Upstream's reboot.c patch makes a handled supercall return 0 instead of falling
+-	 * through to the real reboot path:
+-	 *     if (ret) goto orig_flow;
+-	 *     return ret;
+-	 * We cannot patch reboot.c, so mirror it from the kprobe: skip the rest of
+-	 * __arm64_sys_reboot and return 0 - with these magic values reboot would otherwise
+-	 * return -EINVAL, and the prebuilt ksu_susfs tool checks the syscall result.  The
+-	 * command itself still runs from task_work before we return to userspace. */
+-	regs->pc = regs->regs[30];
+-	regs->regs[0] = 0;
++	/* Hand the syscall over to reboot_tramp(), which runs the command and returns its
++	 * answer straight to invoke_syscall().  Deliberately NOT `regs->pc = regs->regs[30]`:
++	 * resuming at the wrapper's return address from inside the probe is what reset this
++	 * device on the first attempt. */
++	regs->pc = (unsigned long)reboot_tramp;
+ 	return 1;
+ }
+ 
