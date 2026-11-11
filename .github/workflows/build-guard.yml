@@ -19,17 +19,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Fetch guard LKM and apply patch
+      - name: Fetch guard LKM and apply patches
         run: |
           set -eux
           git clone https://github.com/inforcqb/susfs4ksu-lkm "$GITHUB_WORKSPACE/src"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
           cd "$GITHUB_WORKSPACE/src"
           git checkout "${{ inputs.ref }}"
-          if ! git apply -v "$GITHUB_WORKSPACE/patches/01-susfs-supercall-tailjump.patch"; then
-            echo "::error::patch does not apply to ${GITHUB_SHA} - kernel/susfs_supercall.c changed upstream, regenerate the patch"
-            exit 1
-          fi
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            echo "applying $p"
+            if ! git apply -v "$p"; then
+              echo "::error::$p does not apply - its target file changed upstream, regenerate that patch"
+              exit 1
+            fi
+          done
           git diff --stat
 
       - name: Build susfs_guard_lkm.ko
