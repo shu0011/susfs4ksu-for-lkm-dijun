@@ -1,0 +1,38 @@
+--- a/kernel/sus_mount.c
++++ b/kernel/sus_mount.c
+@@ -1158,6 +1158,19 @@
+ };
+ module_param_cb(mount_stat, &sus_mount_stat_ops, NULL, 0400);
+ 
++/* Tail-jump target for "skip this entry".
++ *
++ * The old spelling set regs->pc = regs->regs[30] to fake the callee's return.  x30 is the
++ * caller's return address only when the callee was reached with a bl; a tail-called callee
++ * leaves x30 pointing into an outer frame, and resuming there corrupts that frame - the
++ * crash seen on the first read of /proc/kallsyms.  Jumping to a real function leaves x30
++ * alone, and this one answers 0, which is what every skip site wants.
++ */
++static long susfs_skip_entry(void)
++{
++	return 0;
++}
++
+ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
+ {
+     struct vfsmount *mnt = (struct vfsmount *)regs->regs[1];
+@@ -1193,12 +1206,9 @@
+         return 0;
+     sus_mount_note_id(r);
+     atomic_inc(&n_ident_hits);
+-    regs->pc = regs->regs[30];   /* skip this mount line */
+-    /* These show_* callbacks return int and x0 still holds seq_file*.
+-     * seq_read() treats a negative return as a hard error, so a stray high
+-     * bit here would break the whole read; upstream's equivalent site
+-     * explicitly returns 0. */
+-    regs->regs[0] = 0;
++    regs->pc = (unsigned long)susfs_skip_entry;   /* skip this mount line */
++    /* These show_* callbacks return int; the stub answers 0, which upstream's equivalent
++     * site also returns (seq_read() treats a negative return as a hard error). */
+     return 1;
+ }
+ 

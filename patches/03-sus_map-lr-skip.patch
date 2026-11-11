@@ -1,0 +1,49 @@
+--- a/kernel/sus_map.c
++++ b/kernel/sus_map.c
+@@ -262,14 +262,26 @@
+ 	return true;
+ }
+ 
++/* Tail-jump target for "skip this entry".
++ *
++ * The old spelling set regs->pc = regs->regs[30] to fake the callee's return.  x30 is the
++ * caller's return address only when the callee was reached with a bl; a tail-called callee
++ * leaves x30 pointing into an outer frame, and resuming there corrupts that frame - the
++ * crash seen on the first read of /proc/kallsyms.  Jumping to a real function leaves x30
++ * alone, and this one answers 0, which is what every skip site wants.
++ */
++static long susfs_skip_entry(void)
++{
++	return 0;
++}
++
+ static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
+ {
+ 	struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
+ 
+ 	if (!sus_map_hide_vma(vma, kp->symbol_name))
+ 		return 0;
+-	regs_set_return_value(regs, 0);
+-	regs->pc = regs->regs[30];
++	regs->pc = (unsigned long)susfs_skip_entry;
+ 	return 1;
+ }
+ 
+@@ -474,7 +486,7 @@
+      * that from a skipped walk (upstream's own skip leaves the same value).  Leaving
+      * x0 = mm would turn pagemap_read()'s `ret` into a kernel pointer handed to read(2). */
+     regs_set_return_value(regs, 0);
+-    regs->pc = regs->regs[30];
++    regs->pc = (unsigned long)susfs_skip_entry;
+     return true;
+ }
+ 
+@@ -665,7 +677,7 @@
+ 
+     atomic_inc(&n_vm_hides);
+     regs_set_return_value(regs, 0);     /* "nothing transferred" */
+-    regs->pc = regs->regs[30];          /* skip the call: nothing is pinned */
++    regs->pc = (unsigned long)susfs_skip_entry;  /* nothing is pinned */
+     return 1;
+ }
+ 
